@@ -1,3 +1,5 @@
+use serde_json::Value;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::Arc;
 use std::{ffi, mem, ptr};
@@ -25,6 +27,32 @@ fn get_layout_index(display: *mut _XDisplay) -> usize {
     let mut state = unsafe { mem::zeroed::<_XkbStateRec>() };
     unsafe { XkbGetState(display, 0x0100, &mut state) };
     return state.group as usize;
+}
+
+fn get_hyprland_layout_index() -> Option<usize> {
+    let output = Command::new("hyprctl").args(["-j", "devices"]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let devices: Value = serde_json::from_slice(&output.stdout).ok()?;
+    devices
+        .get("keyboards")?
+        .as_array()?
+        .iter()
+        .find(|keyboard| keyboard.get("main").and_then(Value::as_bool).unwrap_or(false))
+        .or_else(|| {
+            devices
+                .get("keyboards")
+                .and_then(Value::as_array)
+                .and_then(|keyboards| keyboards.first())
+        })
+        .and_then(|keyboard| {
+            keyboard
+                .get("active_layout_index")
+                .and_then(Value::as_u64)
+                .map(|index| index as usize)
+        })
 }
 
 fn send_data(value: &String, layouts: &Vec<String>, data_sender: &broadcast::Sender<Vec<u8>>) {
@@ -58,6 +86,32 @@ impl Provider for LayoutProvider {
         let layouts = &get_config().layouts;
         let data_sender = self.data_sender.clone();
         let is_started = self.is_started.clone();
+        if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
+            std::thread::spawn(move || {
+                let mut synced_layout = None;
+
+                loop {
+                    if !is_started.load(Relaxed) {
+                        break;
+                    }
+
+                    if let Some(layout) = get_hyprland_layout_index() {
+                        if synced_layout != Some(layout) {
+                            synced_layout = Some(layout);
+                            if layout < layouts.len() {
+                                tracing::info!("new hyprland layout index: {0}, layout list: {1:?}", layout, layouts);
+                                let data = vec![DataType::Layout as u8, layout as u8];
+                                data_sender.send(data).unwrap();
+                            }
+                        }
+                    }
+
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            });
+            return;
+        }
+
         std::thread::spawn(move || {
             let mut synced_layout = 0;
             let display = unsafe { XOpenDisplay(ptr::null()) };

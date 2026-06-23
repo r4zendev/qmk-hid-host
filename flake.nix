@@ -21,6 +21,8 @@
         baseDeps = with pkgs; [
           cmake
           rustc
+          cargo
+          rustfmt
           pkg-config
         ];
 
